@@ -8,6 +8,7 @@ const Calibration = () => import('@/views/calibration/index.vue')
 const Reagent = () => import('@/views/reagent/index.vue')
 const Result = () => import('@/views/result/index.vue')
 const Report = () => import('@/views/report/index.vue')
+const ReportDetail = () => import('@/views/report/detail.vue')
 const Qc = () => import('@/views/qc/index.vue')
 const Deviation = () => import('@/views/deviation/index.vue')
 const SampleStorage = () => import('@/views/sample_storage/index.vue')
@@ -31,6 +32,7 @@ const router = createRouter({
     { path: '/reagent', name: 'reagent', component: Reagent },
     { path: '/result', name: 'result', component: Result },
     { path: '/report', name: 'report', component: Report },
+    { path: '/report/:id', name: 'report-detail', component: ReportDetail },
     { path: '/qc', name: 'qc', component: Qc },
     { path: '/deviation', name: 'deviation', component: Deviation },
     { path: '/sample_storage', name: 'sample_storage', component: SampleStorage },

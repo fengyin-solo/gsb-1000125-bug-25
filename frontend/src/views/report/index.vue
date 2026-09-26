@@ -18,13 +18,20 @@
       </article>
     </div>
 
-    <form class="filter-bar" @submit.prevent="reload">
+    <form class="filter-bar" @submit.prevent="applyFilters">
       <label v-for="field in filterFields" :key="field" class="filter-item">
         <span>{{ field }}</span>
         <input v-model="filters[field]" :placeholder="`按${field}检索`" />
       </label>
-      <button class="btn" type="submit">查询</button>
-      <button class="btn ghost" type="button" @click="resetFilters">重置条件</button>
+      <label class="filter-item">
+        <span>报告状态</span>
+        <select v-model="statusFilter">
+          <option value="">全部状态</option>
+          <option v-for="item in statuses" :key="item" :value="item">{{ item }}</option>
+        </select>
+      </label>
+      <button class="btn" type="submit" :disabled="loading">查询</button>
+      <button class="btn ghost" type="button" :disabled="loading" @click="resetFilters">重置条件</button>
     </form>
 
     <table class="data-table">
@@ -43,6 +50,7 @@
               :key="action"
               class="link"
               type="button"
+              :disabled="acting"
               @click="runAction(action, row)"
             >
               {{ action }}
@@ -56,75 +64,187 @@
     </table>
 
     <footer class="page-foot">
-      <span>共 {{ total }} 条检测报告记录</span>
+      <span>共 {{ total }} 条检测报告记录，第 {{ total === 0 ? 0 : page }} / {{ maxPage }} 页</span>
+      <span class="pager">
+        <button class="btn ghost" type="button" :disabled="loading || page <= 1" @click="goPage(page - 1)">上一页</button>
+        <button class="btn ghost" type="button" :disabled="loading || page >= maxPage" @click="goPage(page + 1)">下一页</button>
+      </span>
       <span v-if="errorMessage" class="error-text">{{ errorMessage }}</span>
     </footer>
   </section>
 </template>
 
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 
 import { request } from '@/api/client'
 
 type Row = Record<string, string | number | null>
+type StatCard = { label: string; value: number }
 
 const ENDPOINT = '/api/report'
 const columns = ["报告编号", "委托单位", "样品名称", "报告类型", "编制人", "批准人", "签发日期", "报告状态"]
 const actions = ["编制报告", "提交批准", "撤回报告"]
 const statuses = ["待编制", "编制中", "待批准", "已签发", "已撤回"]
-const stats = [{"label": "待编制报告", "value": 0}, {"label": "待批准报告", "value": 0}, {"label": "本月签发", "value": 0}]
+const PAGE_SIZE = 20
 
 const rows = ref<Row[]>([])
 const total = ref(0)
+const page = ref(1)
 const errorMessage = ref('')
+const loading = ref(false)
+const acting = ref(false)
 const filters = ref<Record<string, string>>({})
-const filterFields = columns.slice(0, 3)
+const statusFilter = ref('')
+const stats = ref<StatCard[]>([
+  { label: '待编制报告', value: 0 },
+  { label: '待批准报告', value: 0 },
+  { label: '本月签发', value: 0 },
+])
+const filterFields = columns.slice(0, 4)
+
+const maxPage = computed(() => Math.max(1, Math.ceil(total.value / PAGE_SIZE)))
+
+// 单调递增的查询序号：快速连续操作时只采用最后一次响应，避免旧数据覆盖新数据
+let requestSeq = 0
+
+function buildQuery(withPage = true): string {
+  const params = new URLSearchParams()
+  for (const field of filterFields) {
+    const value = (filters.value[field] ?? '').trim()
+    if (value) {
+      params.set(field, value)
+    }
+  }
+  if (statusFilter.value) {
+    params.set('status', statusFilter.value)
+  }
+  if (withPage) {
+    params.set('page', String(page.value))
+    params.set('size', String(PAGE_SIZE))
+  }
+  return params.toString()
+}
+
+function applyFilters() {
+  page.value = 1
+  void reload()
+}
 
 function resetFilters() {
   filters.value = {}
+  statusFilter.value = ''
+  page.value = 1
+  void reload()
+}
+
+function goPage(target: number) {
+  if (target < 1 || target > maxPage.value || target === page.value) {
+    return
+  }
+  page.value = target
   void reload()
 }
 
 function exportRows() {
-  window.open(`${ENDPOINT}/export`, '_blank')
+  // 导出与列表共用同一套筛选口径，只去掉分页参数
+  window.open(`${ENDPOINT}/export?${buildQuery(false)}`, '_blank')
 }
 
 function openCreate() {
   errorMessage.value = '检测报告登记入口尚未接入审批流'
 }
 
+function readDetail(payload: unknown, fallback: string): string {
+  if (payload && typeof payload === 'object') {
+    const detail = (payload as { detail?: unknown }).detail
+    if (typeof detail === 'string' && detail) {
+      return detail
+    }
+    const message = (payload as { message?: unknown }).message
+    if (typeof message === 'string' && message) {
+      return message
+    }
+  }
+  return fallback
+}
+
 async function runAction(action: string, row: Row) {
+  if (acting.value) {
+    return
+  }
   errorMessage.value = ''
+  acting.value = true
   try {
     const response = await request(`${ENDPOINT}/${row.id}/actions`, {
       method: 'POST',
       body: JSON.stringify({ action }),
     })
+    const payload: unknown = await response.json().catch(() => null)
     if (!response.ok) {
-      throw new Error('检测报告动作未生效，请稍后重试')
+      throw new Error(readDetail(payload, '检测报告动作未生效，请稍后重试'))
     }
-    await reload()
+    if (payload && typeof payload === 'object' && (payload as { ok?: boolean }).ok === false) {
+      // 业务校验未通过同样按失败处理，不能把拒绝当成成功
+      throw new Error(readDetail(payload, '检测报告动作未生效，请稍后重试'))
+    }
+    await Promise.all([reload(), loadStats()])
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : '检测报告操作失败'
+  } finally {
+    acting.value = false
   }
 }
 
 async function reload() {
   errorMessage.value = ''
-  const query = new URLSearchParams(filters.value as Record<string, string>).toString()
+  loading.value = true
+  const seq = ++requestSeq
   try {
-    const response = await request(`${ENDPOINT}?${query}`)
-    if (!response.ok) {
-      throw new Error('检测报告列表读取失败')
+    const response = await request(`${ENDPOINT}?${buildQuery()}`)
+    const payload: unknown = await response.json().catch(() => null)
+    if (seq !== requestSeq) {
+      return
     }
-    const payload = await response.json()
-    rows.value = payload.items ?? []
-    total.value = payload.total ?? rows.value.length
+    if (!response.ok) {
+      throw new Error(readDetail(payload, '检测报告列表读取失败'))
+    }
+    const data = payload as { items?: Row[]; total?: number }
+    rows.value = data.items ?? []
+    total.value = data.total ?? rows.value.length
+    if (total.value > 0 && page.value > maxPage.value) {
+      // 筛选或动作让结果变少时回到最后一页，不停留在空页上
+      page.value = maxPage.value
+      void reload()
+    }
   } catch (error) {
-    errorMessage.value = error instanceof Error ? error.message : '检测报告列表读取失败'
+    if (seq === requestSeq) {
+      errorMessage.value = error instanceof Error ? error.message : '检测报告列表读取失败'
+    }
+  } finally {
+    if (seq === requestSeq) {
+      loading.value = false
+    }
   }
 }
 
-onMounted(reload)
+async function loadStats() {
+  try {
+    const response = await request(`${ENDPOINT}/stats`)
+    if (!response.ok) {
+      return
+    }
+    const payload = (await response.json()) as { cards?: StatCard[] }
+    if (Array.isArray(payload.cards)) {
+      stats.value = payload.cards
+    }
+  } catch {
+    // 指标读取失败时保留旧值，不打断列表操作
+  }
+}
+
+onMounted(() => {
+  void reload()
+  void loadStats()
+})
 </script>
